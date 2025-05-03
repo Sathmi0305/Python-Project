@@ -11,6 +11,7 @@ import re
 from app import db, jwt
 from app.models.user import User
 from app.utils.validators import validate_email, validate_password, error_response
+from functools import wraps
 
 bp = Blueprint("auth", __name__, url_prefix="/api")
 
@@ -22,6 +23,19 @@ token_blocklist = set()
 def check_if_token_revoked(jwt_header, jwt_payload):
     jti = jwt_payload["jti"]
     return jti in token_blocklist
+
+
+# Admin role check decorator
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        # Get the JWT claims
+        claims = get_jwt()
+        # Check if the user has admin role
+        if claims.get('role') != 'admin':
+            return error_response("Admin access required", 403)
+        return fn(*args, **kwargs)
+    return wrapper
 
 
 # Register the same function at two different endpoints to handle both test variants
@@ -75,6 +89,10 @@ def register():
     if last_name:
         new_user.last_name = last_name
 
+    # Set role if provided (for admin creation)
+    if 'role' in data and data['role'] == 'admin':
+        new_user.role = 'admin'
+
     db.session.add(new_user)
     db.session.commit()
 
@@ -103,7 +121,7 @@ def login():
     # Verify user exists and password is correct
     if not user or not user.check_password(data["password"]):
         return error_response("Invalid credentials", 401)
-    
+
     # Include role in JWT claims
     additional_claims = {'role': user.role, 'password': data['password']}
 
@@ -201,6 +219,55 @@ def change_password():
     db.session.commit()
 
     return jsonify({"message": "Password changed successfully"})
+
+
+@bp.route("/auth/users", methods=["GET"])
+@jwt_required()
+@admin_required
+def get_all_users():
+    """Retrieve a list of all users (Admin-only)"""
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 20, type=int)
+
+    # Get paginated list of users
+    users_query = User.query.order_by(User.id)
+    paginated_users = users_query.paginate(page=page, per_page=per_page, error_out=False)
+
+    users_data = [user.to_dict() for user in paginated_users.items]
+
+    return jsonify({
+        'users': users_data,
+        'page': page,
+        'per_page': per_page,
+        'total': paginated_users.total
+    })
+
+
+@bp.route("/auth/user/<int:user_id>", methods=["DELETE"])
+@jwt_required()
+@admin_required
+def delete_user(user_id):
+    """Delete a user by ID (Admin-only)"""
+    # Prevent deleting yourself
+    current_user_id = int(get_jwt_identity())
+    if current_user_id == user_id:
+        return error_response("Cannot delete your own account", 400)
+
+    user = User.query.get(user_id)
+    if not user:
+        return error_response("User not found", 404)
+
+    # Delete user's accounts first (cascade delete would be better in a real app)
+    from app.models.account import Account
+    accounts = Account.query.filter_by(user_id=user_id).all()
+    for account in accounts:
+        account.is_active = False
+
+    # Delete the user
+    db.session.delete(user)
+    db.session.commit()
+
+    return jsonify({"message": "User deleted successfully"})
 
 
 def validate_password_complexity(password):
